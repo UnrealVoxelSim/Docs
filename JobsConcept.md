@@ -2,226 +2,239 @@
 
 ## Purpose
 
-The job system is a domain API for representing, allocating, executing, and observing work in the simulation.
+The job system provides shared contracts for concrete work, dependency execution, worker allocation, resource allocation, and results in the simulation.
 
-It provides a common language between independent systems:
+All gameplay control is performed by AI. Human players do not directly control countries or pawns. AI controllers choose objectives and generate work; the job runtime coordinates the concrete jobs needed to carry it out. Controllers may delegate to one another without a fixed country, settlement, or pawn hierarchy.
 
-- a system that requests work;
-- a system that decomposes work into executable steps;
-- a system that decides which worker should perform work;
-- a system that executes an assigned step;
-- a system that observes progress and reacts to results.
+The core does not define countries, pawns, navigation, inventory, trees, voxels, production recipes, or construction methods. Domain systems provide these meanings through narrow APIs and adapters.
 
-The job system does not define pawns, factions, settlements, AI, capabilities, navigation, inventory, resources, voxels, workstations, combat, or concrete jobs. Those belong to other domains and integrate through adapters.
-
-The system supports simple requests such as “perform this action” and long-running plans such as “construct this building,” while remaining unaware of the meaning of either request.
+The principal runtime objects are **jobs, dependency edges, assignments, and resource claims**. Objectives and planning state belong to their AI controllers. Current simulation state is persisted and restored; continuous history and replay are not required.
 
 ## Design goals
 
-The API should:
+1. Execute concrete work without prescribing its subject matter.
+2. Allow independent AI issuers, planners, allocators, and executors to cooperate.
+3. Support dependency graphs with parallel branches, shared prerequisites, and joins.
+4. Allocate workers and resources, including outputs that have not yet been produced.
+5. Protect committed resources from consumption by unrelated jobs.
+6. Reject stale execution authority after cancellation, reassignment, or restoration.
+7. Handle unavailable workers, destroyed resources, invalid targets, and failed prerequisites.
+8. Restore active work from snapshots without replaying past events.
+9. Keep the generic API small and domain-specific behavior outside it.
 
-1. represent work without prescribing its subject matter;
-2. allow any number of independent issuers, planners, allocators, and executors;
-3. support hierarchical controllers without requiring a fixed hierarchy;
-4. distinguish a high-level job from the primitive work needed to fulfill it;
-5. allow plans to be generated incrementally and revised while running;
-6. prevent conflicting workers from executing the same exclusive work;
-7. express prerequisites, produced facts, consumed inputs, and synchronization points;
-8. tolerate workers becoming unavailable, work becoming invalid, and the world changing;
-9. expose stable identifiers and event history for persistence, replay, debugging, and UI;
-10. permit new worker types, controllers, capabilities, jobs, and execution strategies without changing the core API.
+## Terms and core model
 
-The API should not assume that every job is autonomous, that every worker is a pawn, that every job has one worker, or that every plan is known in advance.
+A **job** is a concrete execution contract with a stable `JobId`, a domain payload, requirements, priority, issuer authority context, lifecycle state, and structured outcome. An optional correlation identifier links it to the issuing AI's objective. A job keeps its identity across retries.
 
-## Terms
+A **dependency edge** connects a prerequisite job to a dependent job. Initially, its ordering meaning is simply: the prerequisite must succeed before the dependent can run. Material flow additionally uses resource claims; an ordering edge alone does not reserve anything.
 
-A **work request** asks that some outcome be achieved. It is submitted by an issuer and may be satisfied by one job, a plan, or a chain of plans.
+An **assignment** grants an executor authority to perform a job using selected participants. It has an `AssignmentId`, job reference, worker or executor identities, current state, and optional timing policy. Each retry or reassignment receives a new identity, which also distinguishes execution attempts. Separate attempt objects are unnecessary.
 
-A **job** is a unit of work with a lifecycle, requirements, and intended outcome. It may be high-level or directly executable.
+A **resource claim** has a stable identity and commits an opaque resource or quantity to a consuming job. It may refer to an existing resource or a promised output of a producer job. It records the consuming job, any producer/output reference, quantity, access mode, authorized uses, current binding, and status.
 
-A **plan** is a graph or sequence of jobs and dependencies used to fulfill a request. A plan is data and policy owned by the planning system, not by the generic job runtime.
+A **worker** is an entity or executor eligible to perform work. Workers need not be pawns. The first prototype uses individual pawns; the contracts should not assume that all future executors are physical workers or that every job has exactly one participant.
 
-A **step** is an executable part of a job. It may be a primitive action or may itself be delegated to another job system.
+An **objective** is an AI-owned desired world condition, such as a completed cabin or N equipped soldiers. A **plan** is the controller's strategy for achieving that objective. Neither requires a separate generic runtime object.
 
-An **order** is an execution instruction delivered to a worker. It is a runtime projection of an assigned step and may be retried, interrupted, or replaced.
+The core does not require `WorkRequest`, `Plan`, `Step`, `Order`, or `Attempt` objects. Executors may have internal action sequences, and domain APIs may expose high-level requests. These do not become mandatory layers in every job.
 
-A **worker** is any entity or external executor that can accept and perform orders. The API treats workers by identity and reported properties only.
+Identifiers are opaque. Persist references and domain data rather than concrete C++ worker or world objects.
 
-A **capability** is a declarative description of work a worker or executor can perform. The job system matches requirements to capabilities but does not define capability semantics.
+## Responsibilities
 
-A **controller** is any system that creates requests, plans work, allocates workers, executes work, or reacts to events. The API does not reserve these responsibilities for a particular controller type.
+### AI controllers and planners
 
-A **resource** is any identity that can be required, reserved, consumed, produced, locked, or affected by work. It may represent an item, location, entity, reservation domain, or abstract fact.
+Controllers choose objectives, select production methods, generate jobs and dependencies, and decide whether an objective has been achieved. They own persistent planning state and recovery policy.
 
-## Conceptual boundaries
+Automatic dependency construction uses domain-provided rules describing inputs, outputs, prerequisites, and production methods. A planner resolves unmet requirements against existing inventory, resource commitments, and planned production before creating additional work. It must avoid counting the same supply twice and detect unresolved cycles in production rules.
 
-The generic layer has five separable responsibilities.
+For example, a military AI can turn a need for swords into jobs for iron production, forging, delivery, and equipping. Maintaining food per day is an ongoing supply objective, not a prerequisite that becomes permanently satisfied when one farm is built. Its controller continues monitoring supply and issuing finite jobs.
 
-### Requesting
+### Job runtime
 
-An issuer creates a work request with an outcome description, priority, policy metadata, and optional ownership or cancellation information. The issuer may be a player command, a pawn-needs controller, a settlement controller, a planner, or another job system.
+The runtime owns the accepted executable graph, validates its changes, maintains job and assignment state, and determines readiness from prerequisite outcomes and current requirements. It coordinates resource claims and publishes transient state-change events.
 
-### Planning
+### Allocators and eligibility adapters
 
-A planner interprets a request and produces a job or plan. Planning may be eager, lazy, incremental, hierarchical, or delegated. The runtime must not require a planner: a caller may submit a directly executable job.
+Allocators propose eligible workers and apply scheduling policy. Domain adapters validate worker eligibility, resource access, and world conditions. The runtime enforces exclusive assignment authority and rejects conflicting allocations.
 
-### Allocation
+### Executors and resource domains
 
-An allocator selects an eligible worker or workers for an available step. Allocation uses worker identity, capability descriptors, requirements, reservations, priority, and policy supplied by the caller or an allocation service. It must support zero, one, or multiple workers.
+Executors perform navigation and domain actions, retain resumable execution state, and report results. Resource domains own actual creation, movement, splitting, consumption, and destruction. Their APIs enforce the claims coordinated by the generic resource allocation system.
 
-### Execution
+## Dependency graphs and planning changes
 
-An executor turns an assignment into orders and reports progress and terminal results. Execution belongs to the worker integration, not the job domain. A worker can execute a sequence, pause, reject, fail, partially complete, or report that work is no longer valid.
+Executable prerequisite edges form a directed acyclic graph. Independent jobs may run in parallel; multiple prerequisites on one job form a join. A prerequisite may supply several consumers, subject to its output quantities and commitments.
 
-### Observation
+Start with success dependencies. Planners resolve alternatives, conditional branches, cleanup, and compensation into ordinary jobs and graph edits. Mutual exclusion belongs to allocation and resource claims rather than dependency edges.
 
-The runtime records state transitions and publishes events. Controllers can observe events, query state, create follow-up work, replan, or cancel work. Observers do not need to be the issuer or allocator.
+A failed, cancelled, or invalidated prerequisite blocks its dependents and notifies the responsible controller. It does not automatically fail or cancel every connected job. Dependency and correlation links do not imply ownership: cancelling one objective must not silently cancel a shared prerequisite still needed by another.
 
-## Core model
+Controllers may submit additional jobs or revise active work as circumstances change. There is no expansion flag, graph-wide automatic completion, or requirement that all work be known in advance. The controller checks the actual objective state; an empty ready queue does not mean that a cabin is complete.
 
-The minimum persistent model should contain:
+Graph edits must preserve acyclicity and resource commitments. Changes affecting assigned work revoke its execution authority before changed requirements take effect. Replacing a job creates a new identity and explicitly reconnects consumers and claims. Terminal jobs are not reopened. Already-applied world effects remain; controllers arrange any necessary recovery or cleanup.
 
-- `WorkRequestId`, `JobId`, `PlanId`, `StepId`, and `AssignmentId`;
-- `WorkerId` and capability identifiers;
-- lifecycle state;
-- priority and scheduling metadata;
-- requirements and constraints;
-- dependencies;
-- reservation references;
-- timestamps or simulation ticks;
-- version or revision;
-- correlation and parent identifiers;
-- terminal outcome and failure reason.
+Prerequisite completion establishes order, not permanent world validity. A successfully forged sword may later be destroyed. Consumers must also have valid resource bindings and pass domain checks when execution begins and when relevant world effects are applied.
 
-Identifiers are opaque value types. No consumer should infer meaning from their representation.
+## Resource allocation
 
-A job should have a stable identity across retries and reassignment. An attempt, assignment, and order should have separate identities so that history remains distinguishable.
+Resource allocation covers items and quantities as well as worker occupancy, targets, and other exclusive or shared domain resources. The runtime coordinates opaque claims; adapters define what can conflict and enforce those claims on actual resources.
 
-A job may have zero or more child jobs, steps, dependencies, participants, and affected resources. These relationships must not imply a tree: shared prerequisites and coordination between branches require a directed acyclic graph or equivalent dependency model.
+### Existing and future resources
 
-## Requirements and capabilities
+An input can be satisfied by reserving an existing resource or by committing output of a producer job to a consumer. A future output commitment is not an available item and does not make the consumer ready by itself.
 
-A job declares requirements. A worker or executor declares capabilities. Matching uses opaque, extensible descriptors.
+When production succeeds, actual output identities and quantities are bound to their promised consumers before unrelated jobs can acquire them. Production, claim binding, and publication must have no observable interval in which a promised item is unreserved. Shortfalls leave the affected requirements unsatisfied and trigger controller recovery. Only uncommitted output is generally available.
 
-A requirement can describe required capability, quantity or level, worker count, worker role, location or access constraint, tags, equipment or inputs, world facts, exclusions, deadlines, and interruption policy. It should also state whether the condition must hold at allocation, order acceptance, and execution time.
+A producer's output cannot be promised to multiple consumers beyond its committed quantity. For example, an iron bar produced for a particular sword job remains reserved for that job while it waits, even if other forging jobs are ready.
 
-The core API should provide structured fields for common matching and an extension mechanism for domain-specific predicates. It must not interpret “can mine stone,” “has hands,” or “belongs to faction X.”
+### Claim ownership and authorized use
 
-Capabilities are an eligibility declaration, not a guarantee of success. A worker may have a capability but reject an order because its state, equipment, location, or local world facts changed.
+Claims belong to consuming jobs, not worker assignments. Losing or replacing a worker does not release the job's material commitment. A hauling job may be authorized to move an item reserved for a placement job without gaining permission to consume it for another purpose.
 
-## Plans, steps, and sequencing
+The resource domain must preserve the commitment across supported moves, transfers, and stack splits or merges. Any operation that consumes a reserved item must present valid authority for its intended use. Otherwise the reservation guarantee would protect scheduling but not actual consumption.
 
-A plan is an explicit dependency graph. Dependencies may express completion order, milestone waits, produced facts, mutual exclusion, alternatives, conditional branches, result propagation, or invalidation.
+Claims can be exclusive or shared as supported by the domain. Coordinated allocation must either secure its required claims or leave no unintended partial allocation. The concrete mechanism across adapters remains an implementation choice, but intermediate state must not expose conflicting authority to synchronous callbacks.
 
-The core should support ordered sequences, parallel steps, joins, conditional branches, alternatives, cancellation propagation, retry policy, compensation or cleanup steps, milestones, and partial completion.
+### Consumption, release, and destruction
 
-A plan should not require every step to be materialized at creation time. Planners may add, replace, or retire steps as information changes, subject to revision rules and event history.
+Successful consumption fulfills the corresponding claim. Cancellation or terminal failure releases unused claims; released carried items remain in their actual world or inventory location. Retryable execution failure preserves still-needed claims unless recovery policy explicitly changes them.
 
-The distinction between a job, its steps, and individual execution attempts should remain visible even when a job exposes a direct sequence of orders.
+Reservations prevent unauthorized use, not physical destruction. If a bomb destroys a reserved iron bar, its binding becomes invalid, the consumer cannot proceed, and the controller arranges replacement supply or abandons the work. Destruction does not retroactively undo the producer's successful job.
 
-## Allocation and reservations
+Persist active claims, future commitments, and bindings as current simulation state. Revalidate them after restoration.
 
-Allocation creates an assignment with an explicit lease or validity period. It records the selected worker or group, step, evaluated requirements, reservation claims, allocation policy, expiration, renewal data, and assignment state.
+## Eligibility and countries
 
-Reservations are claims over opaque resources or domains. They prevent incompatible work from being allocated concurrently when the integrating domain says they conflict. The API should support exclusive and shared reservations, quantities, ordered acquisition, expiration, release, conflict reporting, and revalidation.
-
-Reservation semantics come from a provider or domain adapter. The generic runtime must not know whether a resource is a voxel, item stack, workstation, target entity, or abstract construction slot.
-
-Reservation ownership must be visible in state and events. Reassignment must produce an explicit transition.
-
-## Execution protocol
-
-An executor should be able to:
-
-1. accept or reject an assignment;
-2. begin an attempt;
-3. report progress or milestones;
-4. report interruption, suspension, or inability to continue;
-5. report success, partial success, or failure;
-6. release or renew reservations as directed by policy.
-
-The protocol must support idempotent commands and duplicate event delivery. Repeating a command after an uncertain connection state must not create a second logical execution.
-
-Execution reports should include structured result and failure payloads. Diagnostic text may be included, but callers must not parse text to make decisions.
-
-## Lifecycle
-
-The lifecycle should separate intent, availability, ownership, execution, and outcome:
+Every job carries its issuer's authority or ownership context. Country membership is a mandatory worker eligibility criterion for the initial game rule:
 
 ```text
-Draft -> Submitted -> Planned -> Available -> Assigned -> Accepted -> Running
-  -> Suspended -> Available
-  -> Succeeded | PartiallySucceeded | Failed | Cancelled | Expired | Invalidated
+worker.CountryId == job.CountryId
 ```
 
-Not every implementation must expose every state, but transitions must be explicit and validated. `Suspended` means work may continue later. `Failed` means the current contract or attempt could not be completed. `Invalidated` means its assumptions or target are no longer valid. `Cancelled` means authorized policy ended it.
+Country identity and semantics belong to the country domain. A narrow eligibility adapter exposes this check to allocation and execution. The generic runtime does not implement diplomacy or a universal capability language.
 
-Retries create a new attempt and preserve job identity. A retry may preserve or reacquire reservations according to policy. Terminal states should be immutable except for annotations or a separate superseding relationship.
+Check eligibility during allocation and again before execution. A country change that makes a worker ineligible revokes the assignment. Domain-specific item, tree, and site access rules must also be enforced where applicable; matching countries alone does not prove that a resource is available.
 
-## Failure and replanning
+Other requirements, such as equipment, reachability, or workstation access, use domain adapters. Persist requirement data or identifiers and reconstruct adapters on load rather than serializing executable predicates. A shared capability descriptor system can be added when integrations need it, but is not a prerequisite for the prototype.
 
-Failure is normal and machine-readable. Extensible categories should include unavailable worker, capability mismatch, reservation conflict, missing input, invalid target, unreachable target, changed world, blocked dependency, interruption, executor rejection, timeout, policy denial, and external failure.
+## Execution and lifecycle
 
-A failure may be retryable, retryable after a condition, recoverable by replanning, terminal for the job, or terminal for its parent plan. The generic layer reports facts and preserves history; a planner or controller decides whether to retry, replace, compensate, escalate, or abandon.
+A job has one lifecycle, distinct from the lifecycle of each assignment:
 
-## Coordination between controllers
+```text
+Job:        Active -> Succeeded | Failed | Cancelled | Invalidated
+Assignment: Offered -> Accepted -> Running -> Completed
+            Offered -> Rejected
+            Offered / Accepted / Running -> Revoked | Failed
+```
 
-Multiple controllers may submit work for the same worker, resource, or objective. Coordination uses explicit priorities, arbitration metadata, reservation providers, authority scopes, leases, cancellation tokens, superseding relationships, conflict events, and deterministic tie-break data.
+Assignment transitions are validated: rejection applies before acceptance, and completion requires execution. Optional lease policies may additionally expire an assignment. An active job exposes whether it is blocked, ready, assigned, running, or suspended; these scheduling conditions do not make an unsuccessful assignment a terminal job failure.
 
-A lower-level controller may submit a request whose fulfillment is delegated to a higher-level controller, and a higher-level controller may submit child requests to lower-level controllers. This is represented by opaque parent and delegation identifiers. The core must not enforce a fixed direction such as “AI plans, pawns execute.”
+An executor accepts or rejects an assignment, begins execution, and reports completion, interruption, or a structured failure. Retryable failure ends the assignment while the job remains active. Controller policy decides whether to retry, wait, replace work, or make the job terminal. Reassignment creates a new `AssignmentId`; no history of old assignments is required.
 
-## Persistence, events, and queries
+Terminal job states are immutable. `Failed` means the contract is abandoned as unsuccessful, `Cancelled` means authorized policy ended it, and `Invalidated` means the contract or target no longer makes sense. Results and failure reasons are machine-readable; diagnostic text is supplementary.
 
-The API should be serializable without serializing concrete workers or world objects. Active assignments and reservations must be revalidated after loading.
+### Revocation and world effects
 
-Every meaningful state change should be a typed event containing event identity, sequence or version, simulation time, affected identifiers, source, structured payload, and correlation and causation identifiers. Consumers should resume from a cursor and safely process duplicates.
+Every execution operation and result identifies its current assignment. Cancelled, revoked, superseded, or expired authority must be rejected. Before replacing an assignment, revoke the old one.
 
-Queries should cover jobs by state or parent, available steps by requirements, assignments by worker, reservations by resource, plan milestones, failures and retries, and changes since a revision.
+Executors validate authority immediately before world-changing operations on the simulation execution context. Checking only the final completion report is insufficient: a stale worker must not consume the log or place the voxel. Resource consumption and its corresponding world effect must complete coherently, without observable half-completion. Domain adapters define how they achieve this.
 
-## Extensibility and module boundaries
+Ordinary in-process interaction uses synchronous APIs. There is no required command queue, network retry protocol, or continuous attempt log. Explicit revocation is sufficient for local executors; deadlines and renewable leases are optional policies where a concrete executor needs them.
 
-New capability, job kind, requirement predicate, result type, failure code, reservation domain, or executor extension should use registered identifiers and payload schemas without changing generic interfaces. Unknown extensions should be preserved when possible and rejected clearly when they cannot be interpreted.
+## Progress and recovery
 
-Possible `.Api` boundaries are:
+The prototype has no generic progress-reporting protocol or `PartiallySucceeded` terminal state. Executors retain domain state needed to continue, such as remaining chopping time or the identity of a carried log. These values are persisted when they affect future execution.
 
-- `JobsConcept.Api`: identifiers, lifecycle, requests, jobs, steps, plans, dependencies, assignments, attempts, results, failures, and events;
-- `JobsRequirements.Api`: capability descriptors, requirement descriptors, matching contracts, and evaluation results;
-- `JobsCoordination.Api`: allocation, worker registry views, leases, reservations, arbitration metadata, and authority scopes;
-- `JobsExecution.Api`: orders, executor interfaces, execution reports, interruption, retry, and idempotency;
-- `JobsPersistence.Api`: serialization, snapshots, event cursors, restoration, and migration metadata.
+Controllers can query domain state when useful: construction can count completed blueprint voxels, inventory can locate materials, and the runtime can expose blocked or running jobs. More advanced AI may use this information to choose interruptions or change staffing without requiring a universal percentage.
 
-A first version may keep these in one `Jobs.Api` module if dependencies remain directed. No `.Api` module should depend on Unreal Actor or pawn classes, voxel or navigation implementations, inventory implementations, concrete AI controllers, or concrete job definitions.
+Partial world effects are not rolled back merely because an assignment fails. A retry must inspect current domain state and continue or request replacement work without duplicating already-completed effects. Cleanup and compensation are ordinary controller-generated jobs.
 
-## Non-goals
+Failures include unavailable worker, eligibility mismatch, reservation conflict, missing input, destroyed resource, invalid target, unreachable target, blocked dependency, interruption, rejection, and policy denial. The runtime exposes the facts; AI controllers choose recovery.
 
-The generic job system does not choose objectives, discover construction methods, navigate, implement mining, chopping, hauling, combat, crafting, or construction, own behavior trees or utility scoring, define pawns or resources, guarantee capability success, replace domain planning, require one global scheduler, require one controller per worker, or require every job to use a physical worker.
+## First prototype: trees and wooden cabins
 
-## Initial acceptance criteria
+The AI-facing operations are `ChopTrees` and `BuildCabin`. A primitive high-level AI requests cabins at random locations. Site validation and construction planning belong to the construction controller, and an invalid site can be rejected. These high-level operations need not each map to one executable runtime job.
 
-The first generic implementation is adequate when it can:
+The [Voxel Construction Proposal](UnrealVoxelSim_Autonomous_Voxel_Construction_Proposal.md) supplies scaffold preprocessing, legal work positions, layer sequencing, and cleanup. Workers modify layer Z from intact scaffold access at Z+1. Placements within a legal layer can run in parallel; the construction controller advances after required work for that layer is complete. Scaffold creation and removal are concrete construction jobs generated by that controller.
 
-1. create and identify a request, job, plan, step, assignment, attempt, and order;
-2. represent a direct step and a multi-step dependency graph;
-3. match opaque worker capabilities against opaque requirements;
-4. assign one worker, multiple workers, or an external executor;
-5. reserve an opaque resource with a lease and report conflicts;
-6. handle acceptance, progress, interruption, retry, success, failure, cancellation, and invalidation;
-7. preserve parent-child and delegation relationships;
-8. publish and replay state transitions;
-9. serialize and restore active work with revalidation;
-10. add a new capability and job payload without changing generic interfaces.
+For this example, assume one log item supplies one wooden voxel. Actual yields and conversion ratios belong to forestry and construction rules.
 
-## Open design questions
+```text
+Primitive AI: BuildCabin(blueprint, location)
+    |
+Construction controller: validate site and prepare scaffold/layer work
+    |
+    +-- ChopTree(tree T) -- promised log --> BuildWoodVoxel(site S, position P)
+    |                                        collect reserved log
+    |                                        haul through construction access
+    |                                        consume log and place wood voxel
+    |
+    +-- Other currently legal placements and their material supply
+    |
+Advance layers, then perform scaffold cleanup and verify the cabin objective
+```
 
-- Should plans be owned by the runtime or by planners, with the runtime storing graph state and references?
-- Should requirements be declarative data only, or may they contain executable predicates?
-- Is reservation atomicity provided by one global coordinator or by pluggable domains?
-- Are orders durable domain objects, transient executor messages, or both?
-- Which transitions are fixed by the API and which are host policy?
-- Does partial success belong to an attempt, a job, or only a result payload?
-- How should progress be represented when steps have incomparable units?
-- How are worker groups formed and replaced?
-- What consistency is required when controllers submit competing work in one simulation tick?
-- Which events are authoritative for persistence and replay?
-- How much validation belongs in the API versus adapters?
-- Is compensation a first-class relation or another dependent step?
+The material cycle is:
+
+1. Create a placement job with a requirement for one log and exclusive target access at P. Exclusive execution access is acquired when the placement is eligible to run; a blocked material requirement need not hold unrelated execution resources.
+2. Reserve an existing log if available. Otherwise the forestry controller selects a tree, creates a chopping job, and commits its future log output to the placement. The tree target is protected against conflicting chopping work.
+3. Assign an eligible worker to chop. Forestry execution produces actual log items through the relevant domain APIs.
+4. Bind the promised output to the placement before exposing the log for unrelated allocation. One tree may supply several placements if it produces enough logs.
+5. Once supply, prerequisite jobs, and construction access are valid, assign the placement to an eligible worker.
+6. The worker collects the log, hauls it to the legal work position, and consumes it while placing the wooden voxel. The placement job succeeds.
+7. Repeat for other required placements, advance layers, and complete cleanup. The construction controller verifies the resulting world state to complete its own objective.
+
+Initially, hauling and placement are one `BuildWoodVoxel` job. Walking, collection, carrying, and placement are executor actions rather than separate core steps or orders. The same pawn may chop and build, but that is an allocator preference, not a dependency requirement.
+
+If specialized hauling is introduced, split delivery and placement into separate jobs. Delivery receives permission to move the placement's reserved log; it does not release that reservation at the construction site.
+
+The current [Trees and Forests design](Trees%20And%20Forests%20Proposal.md) excludes item drops. This prototype therefore also requires actual log production and item/inventory integration; job completion alone does not create resources.
+
+## Simulation execution, persistence, and observation
+
+Follow the existing [execution and persistence architecture](Events,%20Commands%20and%20Persistence%20proposal.md). Authoritative mutation occurs synchronously on one simulation execution context. Composition defines scheduled participant order, and actual API call order resolves competing requests. Priority is allocator policy, not an implicit same-tick batch scheduler.
+
+Observers may react synchronously to events. Publish only after the represented mutation and its observable invariants are complete. Implementations must tolerate reentry or reject it using the existing system-wide execution-guard approach.
+
+Snapshots save current jobs, dependency edges, active assignments, resource claims and bindings, outcomes still referenced by active work, and behavior-affecting execution state. AI objectives and planning state are saved by their owning domains. Optional deadlines use simulation time. Identifiers and entity references follow the existing persistence mapping rules.
+
+Restore into an inactive session, resolve references, reconstruct adapters and derived scheduling state, and reconcile assignments and claims before execution resumes. Callbacks or reports from the previous session must not acquire authority in the restored session. Missing bindings leave work blocked for recovery rather than silently making it ready.
+
+Events are transient synchronous notifications through `Events.Api`. They are not authoritative state and are not persisted. No event history, event cursors, continuous replay, or duplicate-delivery protocol is required. Observers initialize from current-state queries and subscribe without an intervening simulation mutation on the same execution context.
+
+Queries cover current jobs and scheduling conditions, dependencies, assignments by worker, claims by resource or consuming job, and current structured blockers and outcomes. Completed records can be removed once no active work or controller requires them. Old assignments need not be retained, but their identities must not be reused in a way that authorizes stale execution.
+
+## Module boundaries and non-goals
+
+Use one `Jobs.Api` module as the intended production API boundary. It contains the generic contracts for jobs, dependencies, assignments, resource claims, eligibility integration, results, and events. There is no planned split into separate API modules for each concern.
+
+Implementations and integrations use existing event and snapshot infrastructure. Domain payloads and codecs belong to their owning modules. Adding a concrete job or resource adapter should not require changing the generic runtime contracts.
+
+`Jobs.Api` must not depend on Unreal Actors or pawns, concrete AI controllers, voxel or navigation implementations, inventory implementations, or concrete job definitions. It does not choose objectives, discover production recipes, navigate, implement construction, or define country policy.
+
+The system does not require a universal workflow language, a global AI scheduler, one controller per worker, generic progress percentages, mandatory timed leases, automatic parent completion, or persistent execution history.
+
+## Initial acceptance scenarios
+
+1. Execute a direct job with an eligible worker and reject a worker from another country.
+2. Execute parallel prerequisite branches followed by a dependent job; reject cyclic graph edits.
+3. Build a wooden placement through chopping, reserved log production, collection, hauling, and voxel placement. Skip chopping when suitable unreserved supply already exists.
+4. Make two consumers compete for limited supply; never double-commit a quantity or expose a promised output as unreserved between production and binding.
+5. Preserve a consumer's material claim across worker failure, reassignment, and an authorized hauling handoff.
+6. Reject stale world mutations and results after cancellation, reassignment, country changes, and session restoration.
+7. Destroy a reserved resource, block its consumer, and permit the controller to arrange replacement supply without undoing the producer's completed result.
+8. Block dependents after prerequisite failure without automatically cancelling unrelated work or shared prerequisites.
+9. Submit additional cabin work while the objective remains active; finish it by domain-state validation rather than graph exhaustion or expansion flags.
+10. Save and restore during chopping and while carrying a log, preserving action state and claims without duplicating production or consumption.
+11. Release unused claims on terminal cancellation or failure and retain only outcomes needed by current work.
+12. Initialize an observer from current state and deliver subsequent synchronous events without event replay or retained history.
+
+## Remaining implementation decisions
+
+- What concrete adapter protocol makes production, output binding, and consumption coherent across resource and world domains?
+- How are quantity claims represented across item stack splits, merges, and multi-output production?
+- Which initial job payloads, forestry yields, and log-to-voxel conversion rules will the prototype implement?
+- What allocation policy chooses among eligible workers and competing jobs?
+- When a concrete job needs several workers, how does its domain form and replace that group?
