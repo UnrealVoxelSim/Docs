@@ -52,6 +52,62 @@ namespace Containers::Api
 
 }
 
+
+namespace Items::Api
+{
+	// Abstracts consumer for item-producing interfaces.
+	// Concrete implementations may attach PositionComponents and "drop" items inside Voxel World
+	// Others may immediately insert item into a container, skipping attachment-detachment of PositionComponent.
+	// Implementations should be domain-specific. For example, Items::Voxel::Solid should provide its own receivers for voxel-solid items.
+	class IReceiver
+	{
+	public:
+		virtual ~IReceiver() = default;
+
+		// Success: establishes the destination, replacing the previous location.
+		// Failure: leaves the item and its original location unchanged.
+		// V1 receivers preserve entity identity and stack contents.
+		virtual std::expected<void, ReceiveError> Receive(
+			Ecs::Api::EntityId item) = 0;
+	}; 
+	
+	class IPositionReceiverFactory
+	{
+	public:
+		virtual std::unique_ptr<IReceiver> Create(const Spatial::Api::Position& position) = 0;
+	}
+	
+	class ICreator
+	{
+		// Creates a dummy item entity without a position component. Does not attach StackComponent by itself.
+		virtual std::expected<EntityId, CreateError> CreateItem();
+	}
+	
+	/* Probably not needed
+	class IMover
+	{
+		// Changes item position, if PositionComponent present.
+		virtual std::expected<void, MoveError> MoveItem(EntityId entity, const Position& position);
+	}
+	*/
+
+	
+	// Items can be both stackable and non-stackable. Non-stackable items don't have this component.
+	// Items::Api is not responsible for managing stacks. This is domain-defined behavior.
+	// StackComponent is only a shared representation for stacks. Sub-domains define mutation and interpretation.
+	struct StackComponent
+	{
+		// Number of units this items represents.
+		std::size_t Size;
+	}
+	
+	// Intentionally empty, it only tells that an entity is an item.
+	// Payload may be added later.
+	struct ItemComponent final
+	{
+	};
+}
+
 namespace ItemStorage::Api
 {
 
@@ -71,54 +127,36 @@ namespace ItemStorage::Api
 	public:
 		virtual std::expected<void, ExtractError> Extract(
 			Ecs::Api::EntityId item,
-			Spatial::Api::Position position) = 0;
+			IReceiver& receiver) = 0;
 	};
+	
+	class IStorageReceiverFactory
+	{
+	public:
+		virtual std::unique_ptr<Items::Api::IReceiver> Create(Ecs::Api::EntityId container) = 0;
+	}
 
 	// No need for query, Containers::Api::IQuery can be used directly.
 
 }
 
-namespace Items::Api
-{
-	class ICreator
-	{
-		// Creates a dummy item entity with a position component. Does not attach StackComponent by itself.
-		virtual std::expected<EntityId, CreateError> CreateItem(const Position& position);
-	}
-	
-	class IMover
-	{
-		// Changes item position, if PositionComponent present.
-		virtual std::expected<void, MoveError> MoveItem(EntityId entity, const Position& position);
-	}
-	
-	// Items can be both stackable and non-stackable. Non-stackable items don't have this component.
-	// Items::Api is not responsible for managing stacks. This is domain-defined behavior.
-	// StackComponent is only a shared representation for stacks. Sub-domains define mutation and interpretation.
-	struct StackComponent
-	{
-		// Number of units this items represents.
-		std::size_t Size;
-	}
-	
-	// Intentionally empty, it only tells that an entity is an item.
-	// Payload may be added later.
-	struct ItemComponent final
-	{
-	};
-}
 
 // This module is intentionally focused only on items that represent placeable voxels
 // The game will have other items like weapons and tools in the future, but their semantics do not have to be shared with
 // voxel-items.
 namespace Items::Voxel::Solid::Api
 {
-	class IItemCreator
-	{
-		// Attaches Solid Voxel Material to an item. Such item can be placed as a voxel.
-		// Implementation defines maximum stack size for each MaterialId.
-		virtual std::expected<void, CreateError> AttachMaterial(EntityId entity, Voxel::Solid::Api::MaterialId material, size_t initialStackSize)
-	}
+	class ICreator
+    {
+    public:
+        virtual ~ICreator() = default;
+		
+		// Uses Items::Api::ICreator internally, attaches MaterialComponent and invokes IReceiver
+        virtual std::expected<EntityId, CreateError> Create(
+            MaterialId material,
+            std::size_t quantity,
+            Items::Api::IReceiver& receiver) = 0;
+    };
 	
 	struct MaterialComponent
 	{
@@ -155,7 +193,7 @@ namespace Items::Voxel::Solid::Api
 			Ecs::Api::EntityId item,
 			Ecs::Api::EntityId container) = 0;
 	};
-	
+		
 	class IStorageCreator
 	{
 		// Attaches StorageComponent to an entity, making it a valid container for voxel-solid items.
